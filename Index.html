@@ -1,1 +1,253 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BCN Live Arrivals</title>
+<meta name="theme-color" content="#101827">
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1220;color:#f4f7fb;font-family:Arial,sans-serif}
+header{padding:25px 18px;background:#111d31;border-bottom:1px solid #29364b}
+h1{margin:0 0 8px;font-size:27px}
+.sub{color:#a9b8cc;font-size:14px}
+main{max-width:850px;margin:auto;padding:18px}
+.status{background:#142238;border-radius:12px;padding:14px;margin-bottom:18px;font-size:14px}
+.filters{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}
+button{border:1px solid #34445d;background:#17253a;color:#eaf1fb;padding:11px 14px;border-radius:9px;font-weight:bold;cursor:pointer}
+button.active{background:#2878f0;border-color:#2878f0;color:white}
+#flights{display:grid;gap:12px}
+.flight{background:#131f32;border:1px solid #293950;border-radius:13px;padding:15px}
+.flighttop{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.time{font-size:23px;font-weight:bold}
+.airline{font-size:16px;font-weight:bold;margin:9px 0 5px}
+.muted{color:#a9b8cc;font-size:13px;line-height:1.6}
+.tag{font-size:12px;background:#203654;padding:6px 9px;border-radius:7px;white-space:nowrap}
+.empty{padding:25px;text-align:center;color:#b7c4d6;background:#131f32;border-radius:12px;line-height:1.7}
+footer{text-align:center;color:#8595ac;font-size:12px;padding:25px}
+a{color:#8dbbff}
+</style>
+</head>
+<body>
+<header>
+  <h1>✈ BCN Live Arrivals</h1>
+  <div class="sub">Barcelona–El Prat Airport · Arrivals</div>
+</header>
+<main>
+  <div class="status">
+    <div id="status">Connecting to flight data…</div>
+    <div class="muted" id="updated">Last update: —</div>
+  </div>
+
+  <div class="filters" id="filters">
+    <button class="active" data-terminal="ALL">All terminals</button>
+    <button data-terminal="T1">T1</button>
+    <button data-terminal="T2A">T2A</button>
+    <button data-terminal="T2B">T2B</button>
+    <button data-terminal="T2C">T2C</button>
+  </div>
+
+  <div id="flights">
+    <div class="empty">Loading arrivals…</div>
+  </div>
+  <footer>
+    Auto-refresh every 60 seconds · Flight information may change.
+  </footer>
+</main>
+<script>
+const ENDPOINT = "https://aena-mcp.carlos-ls.workers.dev/mcp";
+let allFlights = [];
+let selectedTerminal = "ALL";
+let requestId = 1;
+let sessionId = "";
+
+function parseResponse(text) {
+  const lines = text.split("\n");
+  const data = lines.filter(line => line.startsWith("data:"))
+    .map(line => line.slice(5).trim()).join("\n");
+  try { return JSON.parse(data || text); }
+  catch { throw new Error("Could not read the flight-data response."); }
+}
+
+async function mcp(method, params = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream"
+  };
+  if (sessionId) headers["Mcp-Session-Id"] = sessionId;
+
+  const response = await fetch(ENDPOINT, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: requestId++,
+      method,
+      params
+    })
+  });
+
+  if (!response.ok) throw new Error("Flight service returned HTTP " + response.status);
+  const newSession = response.headers.get("Mcp-Session-Id");
+  if (newSession) sessionId = newSession;
+  const text = await response.text();
+  return parseResponse(text);
+}
+
+function findFlightList(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return null;
+  for (const key of ["flights","arrivals","results","data","items"]) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+  for (const key of ["structuredContent","result","content","text"]) {
+    if (value[key] !== undefined) {
+      const found = findFlightList(value[key]);
+      if (found) return found;
+      if (typeof value[key] === "string") {
+        try {
+          const foundText = findFlightList(JSON.parse(value[key]));
+          if (foundText) return foundText;
+        } catch {}
+      }
+    }
+  }
+  return null;
+}
+
+function get(obj, keys) {
+  for (const key of keys) {
+    if (obj && obj[key] !== undefined && obj[key] !== null && obj[key] !== "") {
+      const value = obj[key];
+      if (typeof value === "object") return value.name || value.code || value.value || "";
+      return String(value);
+    }
+  }
+  return "";
+}
+
+function terminalOf(f) {
+  let t = get(f, ["terminal","terminalName","terminal_name","terminalCode"]);
+  t = t.toUpperCase().replace(/\s/g,"");
+  if (t.includes("T2A") || t === "A") return "T2A";
+  if (t.includes("T2B") || t === "B") return "T2B";
+  if (t.includes("T2C") || t === "C") return "T2C";
+  if (t.includes("T1") || t === "1") return "T1";
+  return t || "Terminal not specified";
+}
+
+function render() {
+  const host = document.getElementById("flights");
+  const flights = allFlights.filter(f => {
+    const t = terminalOf(f);
+    return selectedTerminal === "ALL" ||
+      t === selectedTerminal ||
+      (selectedTerminal === "T1" && t === "1") ||
+      (selectedTerminal === "T2A" && t === "A") ||
+      (selectedTerminal === "T2B" && t === "B") ||
+      (selectedTerminal === "T2C" && t === "C");
+  });
+
+  if (!flights.length) {
+    host.innerHTML = '<div class="empty">No arrivals to display for this filter.<br>Try another terminal or refresh the data.</div>';
+    return;
+  }
+
+  host.innerHTML = flights.map(f => {
+    const time = get(f, ["estimatedTime","estimated_time","scheduledTime",
+      "scheduled_time","arrivalTime","arrival_time","time","hour"]);
+    const airline = get(f, ["airline","airlineName","airline_name","company","carrier"]) || "Airline not specified";
+    const number = get(f, ["flightNumber","flight_number","flight","number","iata"]);
+    const city = get(f, ["origin","originCity","origin_city","departureAirport",
+      "departure_airport","from","airportOrigin"]) || "Origin not specified";
+    const status = get(f, ["status","flightStatus","flight_status"]) || "Arrival";
+    const terminal = terminalOf(f);
+    const belt = get(f, ["belt","baggageBelt","baggage_belt","carousel"]);
+    return `<article class="flight">
+      <div class="flighttop">
+        <span class="time">${escapeHTML(time || "Time unavailable")}</span>
+        <span class="tag">${escapeHTML(terminal)}</span>
+      </div>
+      <div class="airline">${escapeHTML(airline)}</div>
+      <div class="muted">Flight: ${escapeHTML(number || "—")}</div>
+      <div class="muted">From: ${escapeHTML(city)}</div>
+      <div class="muted">Status: ${escapeHTML(status)}${belt ? " · Baggage: " + escapeHTML(belt) : ""}</div>
+    </article>`;
+  }).join("");
+}
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+
+async function loadArrivals() {
+  const status = document.getElementById("status");
+  status.textContent = "Updating flight data…";
+
+  try {
+    const init = await mcp("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "BCN-Live-Arrivals", version: "1.0.0" }
+    });
+
+    await fetch(ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        ...(sessionId ? {"Mcp-Session-Id": sessionId} : {})
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized"
+      })
+    });
+
+    const result = await mcp("tools/call", {
+      name: "search_flights",
+      arguments: {
+        airport: "BCN",
+        direction: "arrivals",
+        source: "auto",
+        collapse_codeshares: true
+      }
+    });
+
+    const list = findFlightList(result);
+    if (!list) throw new Error("The flight service returned an unexpected data format.");
+
+    allFlights = list;
+    render();
+    status.textContent = "Flight data updated · " + allFlights.length + " records";
+    document.getElementById("updated").textContent =
+      "Last update: " + new Date().toLocaleTimeString();
+  } catch (error) {
+    status.textContent = "Could not load live flight data.";
+    document.getElementById("updated").textContent =
+      error.message + " · Check connection or try again.";
+    if (!allFlights.length) {
+      document.getElementById("flights").innerHTML =
+        '<div class="empty">Live data is currently unavailable.<br>' +
+        'The data service may block browser access or may be offline. Please try again later.</div>';
+    }
+  }
+}
+
+document.getElementById("filters").addEventListener("click", event => {
+  const button = event.target.closest("button[data-terminal]");
+  if (!button) return;
+  selectedTerminal = button.dataset.terminal;
+  document.querySelectorAll("#filters button").forEach(b =>
+    b.classList.toggle("active", b === button));
+  render();
+});
+
+loadArrivals();
+setInterval(loadArrivals, 60000);
+</script>
+</body>
+</html>
